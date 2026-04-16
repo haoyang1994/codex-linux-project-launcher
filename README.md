@@ -6,6 +6,8 @@
 
 It is especially useful today in environments where development happens directly in Linux shells, and it remains useful as a lightweight workflow even before future desktop-side remote Linux support becomes standard.
 
+![codexs screenshot](./docs/screenshot.png)
+
 ## What Problem It Solves
 
 When you use Codex across many repositories in a Linux terminal-only environment, the default workflow becomes repetitive:
