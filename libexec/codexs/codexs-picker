@@ -1,0 +1,392 @@
+#!/usr/bin/env python3
+
+import curses
+import json
+import os
+import sqlite3
+import sys
+import time
+from pathlib import Path
+
+
+HOME = str(Path.home())
+CONFIG_FILE = Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))) / "codex-launch" / "config"
+STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local" / "state"))) / "codex-launch"
+RECENT_FILE = STATE_DIR / "recent_projects"
+STATE_DB = Path.home() / ".codex" / "state_5.sqlite"
+
+
+def expand_path(value: str) -> str:
+    if value == "~" or value.startswith("~/"):
+        return str(Path.home() / value[2:])
+    return value
+
+
+def parse_config():
+    pinned = ["~/foo-project-a", "~/foo-project-b"]
+    roots = ["~/foo-workspace"]
+    if CONFIG_FILE.exists():
+        text = CONFIG_FILE.read_text()
+        for line in text.splitlines():
+            line = line.strip()
+            if line.startswith("PINNED_DIRS=(") and line.endswith(")"):
+                pinned = [item.strip().strip('"').strip("'") for item in line[len("PINNED_DIRS=("):-1].split() if item.strip()]
+            if line.startswith("WORKSPACE_ROOTS=(") and line.endswith(")"):
+                roots = [item.strip().strip('"').strip("'") for item in line[len("WORKSPACE_ROOTS=("):-1].split() if item.strip()]
+    return [expand_path(p) for p in pinned], [expand_path(r) for r in roots]
+
+
+def compact(text: str, limit: int) -> str:
+    text = " ".join(text.split())
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1] + "…"
+
+
+def load_recent_dirs():
+    if not RECENT_FILE.exists():
+        return []
+    dirs = []
+    for line in RECENT_FILE.read_text().splitlines():
+        if line and Path(line).is_dir():
+            dirs.append(line)
+    return dirs
+
+
+def save_recent_dir(selected: str, limit: int = 10):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    rows = [selected] + load_recent_dirs()
+    out = []
+    for row in rows:
+        if row not in out and Path(row).is_dir():
+            out.append(row)
+    RECENT_FILE.write_text("\n".join(out[:limit]) + ("\n" if out else ""))
+
+
+def list_projects():
+    pinned, roots = parse_config()
+    rows = []
+    for item in load_recent_dirs():
+        rows.append(item)
+    for item in pinned:
+        if Path(item).is_dir():
+            rows.append(item)
+    for root in roots:
+        root_path = Path(root)
+        if not root_path.is_dir():
+            continue
+        for child in sorted(root_path.iterdir()):
+            if child.is_dir():
+                rows.append(str(child))
+    out = []
+    for row in rows:
+        if row not in out:
+            out.append(row)
+    recents = set(load_recent_dirs())
+    items = []
+    for row in out:
+        label = row.replace(HOME + "/", "")
+        if row in recents:
+            label = f"[recent] {label}"
+        items.append({"path": row, "label": label, "search": label.lower()})
+    return items
+
+
+class Pane:
+    def __init__(self, items, key_field):
+        self.items = items
+        self.key_field = key_field
+        self.filter_text = ""
+        self.index = 0
+        self.offset = 0
+
+    @property
+    def filtered(self):
+        if not self.filter_text:
+            return self.items
+        term = self.filter_text.lower()
+        return [item for item in self.items if term in item[self.key_field].lower()]
+
+    def clamp(self):
+        data = self.filtered
+        if not data:
+            self.index = 0
+            self.offset = 0
+            return
+        self.index = max(0, min(self.index, len(data) - 1))
+        self.offset = max(0, min(self.offset, self.index))
+
+    def current(self):
+        data = self.filtered
+        if not data:
+            return None
+        self.clamp()
+        return data[self.index]
+
+
+SESSION_ROWS_CACHE = {}
+
+
+def format_age(epoch: int) -> str:
+    if not epoch:
+        return "-"
+    delta = max(0, int(time.time()) - int(epoch))
+    if delta < 3600:
+        minutes = max(1, delta // 60)
+        return f"{minutes}m"
+    if delta < 86400:
+        hours = delta // 3600
+        return f"{hours}h"
+    days = delta // 86400
+    return f"{days}d"
+
+
+def load_sessions_for_dir(selected_dir: str):
+    if selected_dir in SESSION_ROWS_CACHE:
+        return SESSION_ROWS_CACHE[selected_dir]
+
+    rows = [{
+        "session_id": "<new>",
+        "created_at": 0,
+        "updated_at": 0,
+        "git_branch": "",
+        "conversation": "<new session>",
+        "label": "<new session>",
+        "search": "<new session>",
+    }]
+
+    if STATE_DB.exists():
+        conn = sqlite3.connect(str(STATE_DB))
+        conn.row_factory = sqlite3.Row
+        cur = conn.execute(
+            """
+            select id, created_at, updated_at, git_branch, title, first_user_message
+            from threads
+            where archived = 0 and cwd = ?
+            order by updated_at desc
+            """,
+            (selected_dir,),
+        )
+        for row in cur.fetchall():
+            conversation = row["title"] or row["first_user_message"] or "(untitled)"
+            conversation = compact(conversation, 96)
+            branch = row["git_branch"] or "-"
+            created = int(row["created_at"] or 0)
+            updated = int(row["updated_at"] or 0)
+            label = f"{format_age(updated):>4}  {compact(branch, 18):<18}  {conversation}"
+            rows.append({
+                "session_id": row["id"],
+                "created_at": created,
+                "updated_at": updated,
+                "git_branch": branch,
+                "conversation": conversation,
+                "label": label,
+                "search": f"{branch} {conversation}".lower(),
+            })
+        conn.close()
+
+    SESSION_ROWS_CACHE[selected_dir] = rows
+    return rows
+
+
+def draw_list(win, y, x, h, w, title, pane, focused):
+    attr_border = curses.color_pair(2 if focused else 1)
+    win.attron(attr_border)
+    win.addstr(y, x, "┌" + "─" * (w - 2) + "┐")
+    for row in range(1, h - 1):
+        win.addstr(y + row, x, "│" + " " * (w - 2) + "│")
+    win.addstr(y + h - 1, x, "└" + "─" * (w - 2) + "┘")
+    win.attroff(attr_border)
+    win.attron(curses.color_pair(3 if focused else 4))
+    win.addstr(y, x + 2, f" {title} ")
+    win.attroff(curses.color_pair(3 if focused else 4))
+
+    inner_h = h - 2
+    inner_w = w - 4
+    data = pane.filtered
+    pane.clamp()
+    if pane.index < pane.offset:
+        pane.offset = pane.index
+    if pane.index >= pane.offset + inner_h:
+        pane.offset = pane.index - inner_h + 1
+
+    for row in range(inner_h):
+        idx = pane.offset + row
+        if idx >= len(data):
+            break
+        item = data[idx]
+        text = item["label"]
+        text = compact(text, inner_w)
+        attr = curses.color_pair(5) if idx == pane.index else curses.color_pair(6 if focused else 7)
+        win.attron(attr)
+        win.addstr(y + 1 + row, x + 2, text.ljust(inner_w))
+        win.attroff(attr)
+
+
+def run(stdscr):
+    curses.curs_set(0)
+    curses.start_color()
+    curses.use_default_colors()
+    if curses.COLORS >= 256:
+        curses.init_pair(1, 241, -1)
+        curses.init_pair(2, 75, -1)
+        curses.init_pair(3, 110, -1)
+        curses.init_pair(4, 188, -1)
+        curses.init_pair(5, 16, 108)
+        curses.init_pair(6, 252, -1)
+        curses.init_pair(7, 245, -1)
+        curses.init_pair(8, 109, -1)
+    else:
+        curses.init_pair(1, curses.COLOR_WHITE, -1)
+        curses.init_pair(2, curses.COLOR_CYAN, -1)
+        curses.init_pair(3, curses.COLOR_CYAN, -1)
+        curses.init_pair(4, curses.COLOR_WHITE, -1)
+        curses.init_pair(5, curses.COLOR_BLACK, curses.COLOR_CYAN)
+        curses.init_pair(6, curses.COLOR_WHITE, -1)
+        curses.init_pair(7, curses.COLOR_WHITE, -1)
+        curses.init_pair(8, curses.COLOR_CYAN, -1)
+
+    projects = Pane(list_projects(), "search")
+    sessions = Pane([{
+        "session_id": "<new>",
+        "created_at": 0,
+        "updated_at": 0,
+        "git_branch": "",
+        "conversation": "<new session>",
+        "label": "<new session>",
+        "search": "<new session>",
+    }], "search")
+    focus = "projects"
+    last_project_path = projects.current()["path"] if projects.current() else HOME
+
+    while True:
+        stdscr.erase()
+        h, w = stdscr.getmaxyx()
+        left_w = max(36, w // 3)
+        right_w = w - left_w - 3
+        content_h = h - 4
+
+        current_project = projects.current()
+        if current_project:
+            current_path = current_project["path"]
+        else:
+            current_path = HOME
+        if current_path != last_project_path:
+            sessions.index = 0
+            sessions.offset = 0
+            sessions.filter_text = ""
+            last_project_path = current_path
+        if focus == "sessions":
+            sessions.items = load_sessions_for_dir(current_path)
+        else:
+            sessions.items = [{
+                "session_id": "<new>",
+                "created_at": 0,
+                "updated_at": 0,
+                "git_branch": "",
+                "conversation": "Press Enter to load native Codex sessions",
+                "label": "Press Enter to load native Codex sessions",
+                "search": "press enter",
+            }]
+        sessions.clamp()
+
+        draw_list(stdscr, 0, 0, content_h, left_w, f"Projects [{projects.filter_text or 'all'}]", projects, focus == "projects")
+        draw_list(stdscr, 0, left_w + 2, content_h, right_w, f"Sessions [{sessions.filter_text or 'all'}]", sessions, focus == "sessions")
+
+        hints = "Tab/Enter switch  Esc back/quit  ↑↓ move  / filter  Backspace delete  Enter on session open"
+        stdscr.attron(curses.color_pair(8))
+        stdscr.addstr(h - 3, 0, " " * max(0, w - 1))
+        stdscr.addstr(h - 3, 1, compact(hints, w - 3))
+        current_session = sessions.current()
+        if focus == "sessions" and current_session and current_session["session_id"] != "<new>":
+            status = (
+                f"Project: {compact(current_path.replace(HOME + '/', ''), 28)}"
+                f"  Branch: {compact(current_session['git_branch'], 18)}"
+                f"  Created: {format_age(current_session['created_at'])}"
+                f"  Updated: {format_age(current_session['updated_at'])}"
+            )
+        else:
+            status = f"Project: {compact(current_path.replace(HOME + '/', ''), w - 12)}"
+        stdscr.addstr(h - 2, 1, compact(status, w - 3))
+        stdscr.attroff(curses.color_pair(8))
+        stdscr.refresh()
+
+        ch = stdscr.get_wch()
+        pane = projects if focus == "projects" else sessions
+        data = pane.filtered
+
+        if ch in ("\t",):
+            if focus == "projects":
+                focus = "sessions"
+                sessions.index = 0
+                sessions.offset = 0
+            else:
+                focus = "projects"
+            continue
+        if ch in (curses.KEY_ENTER, "\n", "\r"):
+            if focus == "projects":
+                focus = "sessions"
+                sessions.index = 0
+                sessions.offset = 0
+                continue
+            current = sessions.current()
+            if current is None:
+                continue
+            return current_path, current["session_id"]
+        if ch == "\x1b":
+            if focus == "sessions":
+                focus = "projects"
+                sessions.filter_text = ""
+                sessions.index = 0
+                sessions.offset = 0
+                continue
+            return None
+        if ch in (curses.KEY_UP, "k"):
+            pane.index = max(0, pane.index - 1)
+            continue
+        if ch in (curses.KEY_DOWN, "j"):
+            pane.index = min(max(0, len(data) - 1), pane.index + 1)
+            continue
+        if ch in (curses.KEY_PPAGE,):
+            pane.index = max(0, pane.index - max(1, content_h - 3))
+            continue
+        if ch in (curses.KEY_NPAGE,):
+            pane.index = min(max(0, len(data) - 1), pane.index + max(1, content_h - 3))
+            continue
+        if ch in ("/",):
+            pane.filter_text = ""
+            pane.index = 0
+            pane.offset = 0
+            continue
+        if ch in (curses.KEY_BACKSPACE, "\b", "\x7f"):
+            if pane.filter_text:
+                pane.filter_text = pane.filter_text[:-1]
+                pane.index = 0
+                pane.offset = 0
+            continue
+        if isinstance(ch, str) and ch.isprintable():
+            pane.filter_text += ch
+            pane.index = 0
+            pane.offset = 0
+
+
+def main():
+    try:
+        result = curses.wrapper(run)
+    except KeyboardInterrupt:
+        return 1
+    if not result:
+        return 1
+    project, session_id = result
+    save_recent_dir(project)
+    output_file = os.environ.get("CODEXS_PICKER_OUTPUT")
+    if output_file:
+        Path(output_file).write_text(f"{project}\n{session_id}\n")
+    else:
+        print(project)
+        print(session_id)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

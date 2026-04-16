@@ -1,0 +1,41 @@
+_codexs_completion() {
+  local cur prev cmd
+  cur="${COMP_WORDS[COMP_CWORD]}"
+  prev="${COMP_WORDS[COMP_CWORD-1]}"
+  cmd="$(command -v codexs 2>/dev/null || printf 'codexs')"
+
+  if [[ "${COMP_WORDS[1]:-}" == "repo" ]]; then
+    if (( COMP_CWORD == 2 )); then
+      COMPREPLY=($(compgen -W "list add remove help" -- "$cur"))
+      return 0
+    fi
+    return 0
+  fi
+
+  if [[ "$prev" == "--" ]]; then
+    return 0
+  fi
+
+  if [[ "$prev" == "--complete-dirs" ]]; then
+    COMPREPLY=($(compgen -W "$("$cmd" --complete-dirs "$cur")" -- "$cur"))
+    compopt -o filenames 2>/dev/null || true
+    return 0
+  fi
+
+  if (( COMP_CWORD == 1 )); then
+    COMPREPLY=($(compgen -W "repo --resume --no-resume --ask-resume --list --help --" -- "$cur"))
+    return 0
+  fi
+
+  case "$cur" in
+    -*)
+      COMPREPLY=($(compgen -W "--resume --no-resume --ask-resume --list --help --" -- "$cur"))
+      return 0
+      ;;
+  esac
+
+  COMPREPLY=($(compgen -W "$("$cmd" --complete-dirs "$cur")" -- "$cur"))
+  compopt -o filenames 2>/dev/null || true
+}
+
+complete -F _codexs_completion codexs

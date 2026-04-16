@@ -1,0 +1,21 @@
+# AUTO_RESUME=ask|always|never
+AUTO_RESUME=ask
+RECENT_LIMIT=10
+DEFAULT_YOLO=1
+
+# Picker theming
+FZF_OPTS='--height=85% --layout=reverse --border=rounded --info=inline-right --prompt=Select> --pointer=› --marker=• --ansi --preview-window=right:52%:wrap --bind=ctrl-r:toggle-sort --color=bg:#282c34,bg+:#2c323c,fg:#abb2bf,fg+:#e5c07b,hl:#61afef,hl+:#56b6c2 --color=border:#3e4452,header:#61afef,info:#7f848e,pointer:#98c379,marker:#98c379,prompt:#c678dd,spinner:#56b6c2'
+# NEWT_COLORS='root=,black
+# window=white,black
+# border=brightblue,black
+# title=brightwhite,black
+# button=black,brightcyan
+# actbutton=black,white
+# entry=white,black
+# textbox=white,black
+# listbox=white,black
+# actlistbox=black,brightcyan'
+
+# Project discovery
+PINNED_DIRS=(__PINNED_DIRS__)
+WORKSPACE_ROOTS=(__WORKSPACE_ROOTS__)

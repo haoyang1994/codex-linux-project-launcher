@@ -1,0 +1,769 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+SELF_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
+SELF_DIR="$(cd -- "$(dirname -- "$SELF_PATH")" && pwd -P)"
+INSTALL_PREFIX="$(cd -- "$SELF_DIR/.." && pwd -P)"
+
+CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/codex-launch/config"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/codex-launch"
+RECENT_FILE="$STATE_DIR/recent_projects"
+AUTO_RESUME_MODE="${CODEX_LAUNCH_AUTO_RESUME:-ask}"
+CODEX_BIN="${CODEX_BIN:-codex}"
+PICKER_BIN="${CODEX_PICKER_BIN:-$INSTALL_PREFIX/libexec/codexs/codexs-picker}"
+RECENT_LIMIT="${CODEX_LAUNCH_RECENT_LIMIT:-10}"
+DEFAULT_YOLO_MODE="${CODEX_LAUNCH_DEFAULT_YOLO:-1}"
+FZF_DEFAULT_OPTS_BASE='--height=85% --layout=reverse --border=rounded --info=inline-right --prompt=Select> --pointer=› --marker=• --ansi --preview-window=right:52%:wrap --bind=ctrl-r:toggle-sort'
+FZF_THEME_OPTS='--color=bg:#282c34,bg+:#2c323c,fg:#abb2bf,fg+:#e5c07b,hl:#61afef,hl+:#56b6c2 --color=border:#3e4452,header:#61afef,info:#7f848e,pointer:#98c379,marker:#98c379,prompt:#c678dd,spinner:#56b6c2'
+FZF_OPTS="${CODEX_LAUNCH_FZF_OPTS:-$FZF_DEFAULT_OPTS_BASE $FZF_THEME_OPTS}"
+WHIPTAIL_COLORS_DEFAULT='root=,black
+window=white,black
+border=brightblue,black
+title=brightwhite,black
+textbox=white,black
+button=black,brightcyan
+actbutton=black,white
+entry=white,black
+shadow=black,black
+compactbutton=white,black
+listbox=white,black
+actlistbox=black,brightcyan
+actsel=black,brightcyan
+sellistbox=black,brightcyan
+checkbox=white,black'
+WHIPTAIL_COLORS="${CODEX_LAUNCH_NEWT_COLORS:-$WHIPTAIL_COLORS_DEFAULT}"
+declare -a PINNED_DIRS=()
+declare -a WORKSPACE_ROOTS=("$HOME/foo-workspace")
+
+usage() {
+  cat <<'EOF'
+Usage:
+  codexs [OPTIONS] [DIR] [-- CODEX_ARGS...]
+  codexs repo <list|add|remove> [PATH...]
+
+Start Codex in a selected project directory or manage configured project paths.
+
+Launcher options:
+  -r, --resume        Resume the most recent session for the chosen directory
+  -n, --no-resume     Start a new session
+  -a, --ask-resume    Ask whether to resume after choosing the directory
+      --sandbox ...   Forward sandbox mode to codex and disable default --yolo
+      --list          Print candidate directories
+      --complete-dirs [PREFIX]
+                      Internal helper for shell completion
+  -h, --help          Show this help
+
+Repo commands:
+  repo list           Show configured project paths and workspace roots
+  repo add PATH...    Add one or more project paths to PINNED_DIRS
+  repo remove PATH... Remove one or more project paths from PINNED_DIRS
+
+Config:
+  ~/.config/codex-launch/config
+    AUTO_RESUME=ask|always|never
+    DEFAULT_YOLO=1
+    RECENT_LIMIT=10
+    FZF_OPTS='...'
+    NEWT_COLORS='...'
+    PINNED_DIRS=(~/foo-project-a ~/foo-project-b)
+    WORKSPACE_ROOTS=(~/foo-workspace)
+
+Examples:
+  codexs
+  codexs ~/foo-workspace/foo-project -- --search
+  codexs repo list
+  codexs repo add ~/foo-project-c
+  codexs repo remove ~/foo-project-a
+EOF
+}
+
+repo_usage() {
+  cat <<'EOF'
+Repo commands:
+  repo list           Show configured project paths and workspace roots
+  repo add PATH...    Add one or more project paths to PINNED_DIRS
+  repo remove PATH... Remove one or more project paths from PINNED_DIRS
+EOF
+}
+
+log() {
+  printf '%s\n' "$*"
+}
+
+die() {
+  printf '%s\n' "$*" >&2
+  exit 1
+}
+
+command_exists() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+load_config() {
+  if [[ -f "$CONFIG_FILE" ]]; then
+    # shellcheck disable=SC1090
+    source "$CONFIG_FILE"
+    if [[ -n "${AUTO_RESUME:-}" ]]; then
+      AUTO_RESUME_MODE="$AUTO_RESUME"
+    fi
+    if [[ -n "${RECENT_LIMIT:-}" ]]; then
+      RECENT_LIMIT="$RECENT_LIMIT"
+    fi
+    if [[ -n "${DEFAULT_YOLO:-}" ]]; then
+      DEFAULT_YOLO_MODE="$DEFAULT_YOLO"
+    fi
+    if [[ -n "${FZF_OPTS:-}" ]]; then
+      FZF_OPTS="$FZF_OPTS"
+    fi
+    if [[ -n "${NEWT_COLORS:-}" ]]; then
+      WHIPTAIL_COLORS="$NEWT_COLORS"
+    fi
+  fi
+}
+
+expand_path() {
+  local value="$1"
+  if [[ "$value" == "~" || "$value" == ~/* ]]; then
+    printf '%s\n' "${value/#\~/$HOME}"
+  elif [[ "$value" == /* ]]; then
+    printf '%s\n' "$value"
+  else
+    printf '%s\n' "$PWD/$value"
+  fi
+}
+
+display_path() {
+  local value="$1"
+  if [[ "$value" == "$HOME" ]]; then
+    printf '~\n'
+  elif [[ "$value" == "$HOME/"* ]]; then
+    printf '~/%s\n' "${value#"$HOME/"}"
+  else
+    printf '%s\n' "$value"
+  fi
+}
+
+append_if_dir() {
+  local -n ref=$1
+  local dir
+  dir="$(expand_path "$2")"
+  [[ -d "$dir" ]] && ref+=("$dir")
+}
+
+list_recent_dirs() {
+  [[ -f "$RECENT_FILE" ]] || return 0
+  while IFS= read -r dir; do
+    [[ -n "$dir" && -d "$dir" ]] && printf '%s\n' "$dir"
+  done < "$RECENT_FILE"
+}
+
+is_recent_dir() {
+  local target="$1"
+  local dir
+  while IFS= read -r dir; do
+    [[ "$dir" == "$target" ]] && return 0
+  done < <(list_recent_dirs)
+  return 1
+}
+
+save_recent_dir() {
+  local selected="$1"
+  local tmp
+  mkdir -p "$STATE_DIR"
+  tmp="$(mktemp)"
+  {
+    printf '%s\n' "$selected"
+    list_recent_dirs
+  } | awk 'NF && !seen[$0]++' | sed -n "1,${RECENT_LIMIT}p" > "$tmp"
+  mv "$tmp" "$RECENT_FILE"
+}
+
+emit_bash_array() {
+  local name="$1"
+  shift
+  local item
+  printf '%s=(' "$name"
+  for item in "$@"; do
+    printf '%q ' "$item"
+  done
+  printf ')\n'
+}
+
+write_config() {
+  local config_dir
+  config_dir="$(dirname "$CONFIG_FILE")"
+  mkdir -p "$config_dir"
+  cat > "$CONFIG_FILE" <<EOF
+# AUTO_RESUME=ask|always|never
+AUTO_RESUME=$AUTO_RESUME_MODE
+RECENT_LIMIT=$RECENT_LIMIT
+DEFAULT_YOLO=$DEFAULT_YOLO_MODE
+FZF_OPTS=$(printf '%q' "$FZF_OPTS")
+# NEWT_COLORS=$(printf '%q' "$WHIPTAIL_COLORS_DEFAULT")
+EOF
+  if [[ "$WHIPTAIL_COLORS" != "$WHIPTAIL_COLORS_DEFAULT" ]]; then
+    printf 'NEWT_COLORS=%q\n' "$WHIPTAIL_COLORS" >> "$CONFIG_FILE"
+  fi
+  emit_bash_array PINNED_DIRS "${PINNED_DIRS[@]}" >> "$CONFIG_FILE"
+  emit_bash_array WORKSPACE_ROOTS "${WORKSPACE_ROOTS[@]}" >> "$CONFIG_FILE"
+}
+
+config_add_pinned_dirs() {
+  local path normalized existing found
+  for path in "$@"; do
+    normalized="$(expand_path "$path")"
+    found=0
+    for existing in "${PINNED_DIRS[@]}"; do
+      if [[ "$existing" == "$normalized" ]]; then
+        found=1
+        break
+      fi
+    done
+    if (( ! found )); then
+      PINNED_DIRS+=("$normalized")
+      log "Added $(display_path "$normalized")"
+    else
+      log "Skip existing $(display_path "$normalized")"
+    fi
+  done
+  write_config
+}
+
+config_remove_pinned_dirs() {
+  local path normalized existing
+  local -a next=()
+  local removed_any=0
+
+  for path in "$@"; do
+    normalized="$(expand_path "$path")"
+    next=()
+    for existing in "${PINNED_DIRS[@]}"; do
+      if [[ "$existing" == "$normalized" ]]; then
+        removed_any=1
+      else
+        next+=("$existing")
+      fi
+    done
+    PINNED_DIRS=("${next[@]}")
+    log "Processed remove $(display_path "$normalized")"
+  done
+
+  if (( ! removed_any )); then
+    log "No matching configured project paths were removed."
+  fi
+  write_config
+}
+
+repo_list() {
+  local path
+  printf 'Pinned project paths:\n'
+  if (( ${#PINNED_DIRS[@]} == 0 )); then
+    printf '  (none)\n'
+  else
+    for path in "${PINNED_DIRS[@]}"; do
+      printf '  %s\n' "$(display_path "$path")"
+    done
+  fi
+  printf 'Workspace roots:\n'
+  if (( ${#WORKSPACE_ROOTS[@]} == 0 )); then
+    printf '  (none)\n'
+  else
+    for path in "${WORKSPACE_ROOTS[@]}"; do
+      printf '  %s\n' "$(display_path "$path")"
+    done
+  fi
+}
+
+handle_repo_command() {
+  local subcommand="${1:-}"
+  shift || true
+
+  case "$subcommand" in
+    list)
+      repo_list
+      ;;
+    add)
+      (( $# > 0 )) || die "Usage: codexs repo add PATH..."
+      config_add_pinned_dirs "$@"
+      ;;
+    remove)
+      (( $# > 0 )) || die "Usage: codexs repo remove PATH..."
+      config_remove_pinned_dirs "$@"
+      ;;
+    -h|--help|help|"")
+      repo_usage
+      ;;
+    *)
+      die "Unknown repo command: $subcommand"
+      ;;
+  esac
+}
+
+run_whiptail() {
+  NEWT_COLORS="$WHIPTAIL_COLORS" whiptail "$@"
+}
+
+prompt_filter_whiptail() {
+  local current="${1:-}"
+  run_whiptail --title "Project Filter" --inputbox "Filter projects before showing the list. Leave empty to show all projects." 10 72 "$current" 3>&1 1>&2 2>&3
+}
+
+prompt_filter_select() {
+  local current="${1:-}"
+  local next
+  if [[ -n "$current" ]]; then
+    read -r -p "Filter text (current: $current, empty for all): " next
+  else
+    read -r -p "Filter text (empty for all): " next
+  fi
+  printf '%s\n' "$next"
+}
+
+list_candidates() {
+  local -a candidates=()
+  local dir
+  local root
+
+  while IFS= read -r dir; do
+    [[ -n "$dir" ]] && candidates+=("$dir")
+  done < <(list_recent_dirs)
+
+  for dir in "${PINNED_DIRS[@]}"; do
+    append_if_dir candidates "$dir"
+  done
+
+  for root in "${WORKSPACE_ROOTS[@]}"; do
+    root="$(expand_path "$root")"
+    [[ -d "$root" ]] || continue
+    while IFS= read -r dir; do
+      [[ -n "$dir" ]] && candidates+=("$dir")
+    done < <(find "$root" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort)
+  done
+
+  printf '%s\n' "${candidates[@]}" | awk 'NF && !seen[$0]++'
+}
+
+complete_dirs() {
+  local prefix="${1:-}"
+  local dir
+
+  while IFS= read -r dir; do
+    [[ -z "$prefix" || "$dir" == "$prefix"* ]] && printf '%s\n' "$dir"
+  done < <(list_candidates)
+}
+
+contains_sandbox_arg() {
+  local arg
+  for arg in "$@"; do
+    case "$arg" in
+      -s|--sandbox|--sandbox=*)
+        return 0
+        ;;
+    esac
+  done
+  return 1
+}
+
+list_sessions_for_dir() {
+  local target_dir="$1"
+  local sessions_root="$HOME/.codex/sessions"
+  local index_file="$HOME/.codex/session_index.jsonl"
+  local history_file="$HOME/.codex/history.jsonl"
+  [[ -d "$sessions_root" && -f "$index_file" ]] || return 0
+
+  TARGET_DIR="$target_dir" SESSIONS_ROOT="$sessions_root" SESSION_INDEX="$index_file" HISTORY_FILE="$history_file" python3 - <<'PY'
+import json
+import os
+from pathlib import Path
+
+target = os.environ["TARGET_DIR"]
+sessions_root = Path(os.environ["SESSIONS_ROOT"])
+index_file = Path(os.environ["SESSION_INDEX"])
+history_file = Path(os.environ["HISTORY_FILE"])
+
+def compact(text: str, limit: int = 90) -> str:
+    text = " ".join(text.split())
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1] + "…"
+
+name_by_id = {}
+updated_by_id = {}
+for line in index_file.read_text().splitlines():
+    if not line.strip():
+        continue
+    try:
+        obj = json.loads(line)
+    except Exception:
+        continue
+    session_id = obj.get("id")
+    if not session_id:
+        continue
+    if obj.get("thread_name"):
+        name_by_id[session_id] = obj["thread_name"]
+    if obj.get("updated_at"):
+        old = updated_by_id.get(session_id)
+        if old is None or obj["updated_at"] > old:
+            updated_by_id[session_id] = obj["updated_at"]
+
+summary_by_id = {}
+if history_file.exists():
+    for line in history_file.read_text().splitlines():
+        if not line.strip():
+            continue
+        try:
+            obj = json.loads(line)
+        except Exception:
+            continue
+        session_id = obj.get("session_id")
+        text = obj.get("text")
+        ts = obj.get("ts")
+        if not session_id or not text:
+            continue
+        prev = summary_by_id.get(session_id)
+        if prev is None or (ts is not None and ts >= prev[0]):
+            summary_by_id[session_id] = (ts or 0, compact(text))
+
+rows = []
+for path in sessions_root.rglob("*.jsonl"):
+    try:
+        with path.open() as f:
+            first = f.readline()
+    except Exception:
+        continue
+    if not first:
+        continue
+    try:
+        obj = json.loads(first)
+    except Exception:
+        continue
+    payload = obj.get("payload", {})
+    session_id = payload.get("id")
+    cwd = payload.get("cwd")
+    if not session_id or cwd != target:
+        continue
+    updated_at = updated_by_id.get(session_id) or payload.get("timestamp") or obj.get("timestamp") or ""
+    thread_name = name_by_id.get(session_id, "")
+    summary = summary_by_id.get(session_id, ("", ""))[1]
+    title = compact(thread_name, 60) if thread_name else "(untitled)"
+    if summary == title:
+        summary = ""
+    rows.append((updated_at, session_id, title, summary))
+
+rows.sort(reverse=True)
+seen = set()
+for updated_at, session_id, title, summary in rows:
+    if session_id in seen:
+        continue
+    seen.add(session_id)
+    print(f"{session_id}\t{updated_at}\t{title}\t{summary}")
+PY
+}
+
+pick_with_fzf() {
+  local -n _dirs_ref=$1
+  local line dir rel prefix
+  local -a entries=()
+
+  for dir in "${_dirs_ref[@]}"; do
+    rel="${dir#$HOME/}"
+    [[ "$rel" == "$dir" ]] && rel="$dir"
+    prefix=" "
+    if is_recent_dir "$dir"; then
+      prefix="R"
+    fi
+    entries+=("$prefix  $rel"$'\t'"$dir")
+  done
+
+  line="$(printf '%s\n' "${entries[@]}" | fzf \
+    --delimiter=$'\t' \
+    --with-nth=1 \
+    --nth=1 \
+    --preview 'p={2}; printf "Path\n%s\n\n" "$p"; if [ -d "$p/.git" ]; then printf "Repo\ngit\n\n"; fi; ls -la "$p" 2>/dev/null | sed -n "1,60p"' \
+    --header $'Projects. Type to filter. Enter selects.\n' \
+    $FZF_OPTS)" || return 1
+
+  printf '%s\n' "${line#*$'\t'}"
+}
+
+pick_session_with_fzf() {
+  local selected_dir="$1"
+  local line rel
+  rel="${selected_dir#$HOME/}"
+  [[ "$rel" == "$selected_dir" ]] && rel="$selected_dir"
+
+  line="$(
+    {
+      printf '<new>\t-\tNew session\tStart a fresh session in this directory\n'
+      list_sessions_for_dir "$selected_dir"
+    } | awk 'NF && !seen[$0]++' | fzf \
+      --delimiter=$'\t' \
+      --with-nth=3,4,2 \
+      --nth=3,4,2 \
+      --prompt='Resume> ' \
+      --preview 'if [ "{1}" = "<new>" ]; then printf "Directory\n%s\n\nAction\nStart a fresh session\n" "'"$selected_dir"'"; else printf "Session ID\n%s\n\nUpdated\n%s\n\nTitle\n%s\n\nSummary\n%s\n\nDirectory\n%s\n" "{1}" "{2}" "{3}" "{4}" "'"$selected_dir"'"; fi' \
+      --header $'Sessions for '"$rel"$'. <new> is the default.\n' \
+      $FZF_OPTS
+  )" || return 1
+
+  printf '%s\n' "${line%%$'\t'*}"
+}
+
+pick_with_whiptail() {
+  local -n _dirs_ref=$1
+  local -a current_dirs=("${_dirs_ref[@]}")
+  local -a menu=()
+  local i rel choice filter=""
+
+  filter="$(prompt_filter_whiptail "$filter")" || return 1
+
+  while true; do
+    menu=()
+    current_dirs=()
+
+    for i in "${!_dirs_ref[@]}"; do
+      rel="${_dirs_ref[$i]#$HOME/}"
+      [[ "$rel" == "${_dirs_ref[$i]}" ]] && rel="${_dirs_ref[$i]}"
+      if [[ -n "$filter" ]]; then
+        case "${rel,,}" in
+          *"${filter,,}"*) ;;
+          *) continue ;;
+        esac
+      fi
+      current_dirs+=("${_dirs_ref[$i]}")
+      if is_recent_dir "${_dirs_ref[$i]}"; then
+        rel="[recent] $rel"
+      fi
+      menu+=("${#current_dirs[@]}" "$rel")
+    done
+    menu+=("/" "[change filter] current: ${filter:-<none>}")
+
+    if (( ${#current_dirs[@]} == 0 )); then
+      run_whiptail --title "Codex Workspace" --msgbox "No projects matched filter: ${filter:-<none>}" 10 72
+    else
+      choice="$(run_whiptail --title "Codex Workspace" --menu "Choose a directory. Current filter: ${filter:-<none>}" 22 110 14 "${menu[@]}" 3>&1 1>&2 2>&3)" || return 1
+      if [[ "$choice" != "/" ]]; then
+        printf '%s\n' "${current_dirs[$((choice - 1))]}"
+        return 0
+      fi
+    fi
+
+    filter="$(prompt_filter_whiptail "$filter")" || return 1
+  done
+}
+
+pick_with_select() {
+  local -n _dirs_ref=$1
+  local i=1
+  local rel choice filter=""
+  local -a current_dirs=()
+
+  filter="$(prompt_filter_select "$filter")"
+
+  while true; do
+    current_dirs=()
+    i=1
+    printf 'Choose a directory'
+    [[ -n "$filter" ]] && printf ' [filter=%s]' "$filter"
+    printf ':\n' >&2
+    for choice in "${_dirs_ref[@]}"; do
+      rel="${choice#$HOME/}"
+      [[ "$rel" == "$choice" ]] && rel="$choice"
+      if [[ -n "$filter" ]]; then
+        case "${rel,,}" in
+          *"${filter,,}"*) ;;
+          *) continue ;;
+        esac
+      fi
+      current_dirs+=("$choice")
+      if is_recent_dir "$choice"; then
+        rel="[recent] $rel"
+      fi
+      printf '  %d) %s\n' "$i" "$rel" >&2
+      ((i++))
+    done
+    printf '  /) change filter (current: %s)\n' "${filter:-<none>}" >&2
+    read -r -p "Enter number: " choice
+    if [[ "$choice" == "/" ]]; then
+      filter="$(prompt_filter_select "$filter")"
+      continue
+    fi
+    [[ "$choice" =~ ^[0-9]+$ ]] || continue
+    if (( choice >= 1 && choice <= ${#current_dirs[@]} )); then
+      printf '%s\n' "${current_dirs[$((choice - 1))]}"
+      return 0
+    fi
+  done
+}
+
+pick_directory() {
+  local -a dirs=()
+  local dir
+
+  while IFS= read -r dir; do
+    [[ -n "$dir" ]] && dirs+=("$dir")
+  done < <(list_candidates)
+
+  (( ${#dirs[@]} > 0 )) || die "No candidate directories found."
+
+  if command_exists fzf; then
+    pick_with_fzf dirs
+    return
+  fi
+
+  if command_exists whiptail; then
+    pick_with_whiptail dirs
+  else
+    pick_with_select dirs
+  fi
+}
+
+pick_session() {
+  local selected_dir="$1"
+  if command_exists fzf; then
+    pick_session_with_fzf "$selected_dir"
+    return
+  fi
+  printf '<new>\n'
+}
+
+normalize_dir() {
+  local dir="$1"
+  [[ -d "$dir" ]] || die "Directory not found: $dir"
+  cd "$dir"
+  pwd -P
+}
+
+load_config
+
+if [[ "${1:-}" == "repo" ]]; then
+  shift
+  handle_repo_command "$@"
+  exit 0
+fi
+
+resume_mode="$AUTO_RESUME_MODE"
+selected_dir=""
+declare -a passthrough_args=()
+declare -a codex_args=()
+enable_yolo="$DEFAULT_YOLO_MODE"
+
+while (( $# > 0 )); do
+  case "$1" in
+    -r|--resume)
+      resume_mode="always"
+      shift
+      ;;
+    -n|--no-resume)
+      resume_mode="never"
+      shift
+      ;;
+    -a|--ask-resume)
+      resume_mode="ask"
+      shift
+      ;;
+    --list)
+      list_candidates
+      exit 0
+      ;;
+    --complete-dirs)
+      shift
+      complete_dirs "${1:-}"
+      exit 0
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      passthrough_args+=("$@")
+      break
+      ;;
+    -s|--sandbox)
+      passthrough_args+=("$1")
+      shift
+      (( $# > 0 )) || die "Missing value for --sandbox."
+      passthrough_args+=("$1")
+      enable_yolo=0
+      shift
+      ;;
+    --sandbox=*)
+      passthrough_args+=("$1")
+      enable_yolo=0
+      shift
+      ;;
+    -*)
+      passthrough_args+=("$1")
+      shift
+      ;;
+    *)
+      if [[ -z "$selected_dir" ]]; then
+        selected_dir="$1"
+      else
+        passthrough_args+=("$1")
+      fi
+      shift
+      ;;
+  esac
+done
+
+if [[ -z "$selected_dir" ]]; then
+  if [[ -x "$PICKER_BIN" ]]; then
+    picker_output="$(mktemp)"
+    CODEXS_PICKER_OUTPUT="$picker_output" "$PICKER_BIN" || {
+      rm -f "$picker_output"
+      die "Canceled."
+    }
+    mapfile -t picker_result < "$picker_output"
+    rm -f "$picker_output"
+    selected_dir="${picker_result[0]:-}"
+    selected_session="${picker_result[1]:-<new>}"
+    [[ -n "$selected_dir" ]] || die "Canceled."
+  else
+    selected_dir="$(pick_directory)" || exit 1
+  fi
+fi
+
+selected_dir="$(normalize_dir "$selected_dir")"
+if [[ ! -x "$PICKER_BIN" ]]; then
+  save_recent_dir "$selected_dir"
+  selected_session="<new>"
+fi
+
+# `codex -C` sets the agent workspace root, but interactive commands such as
+# `/resume` still consult the process cwd for session filtering.
+cd "$selected_dir"
+
+if [[ "$enable_yolo" != "0" ]] && contains_sandbox_arg "${passthrough_args[@]}"; then
+  enable_yolo=0
+fi
+if [[ "$enable_yolo" != "0" ]]; then
+  codex_args+=(--yolo)
+fi
+
+case "$resume_mode" in
+  always)
+    if [[ ! -x "$PICKER_BIN" ]]; then
+      selected_session="$(pick_session "$selected_dir")" || exit 1
+    fi
+    ;;
+  never)
+    selected_session="<new>"
+    ;;
+  ask)
+    if [[ ! -x "$PICKER_BIN" ]]; then
+      selected_session="$(pick_session "$selected_dir")" || exit 1
+    fi
+    ;;
+  *)
+    die "Invalid AUTO_RESUME mode: $resume_mode"
+    ;;
+esac
+
+if [[ "$selected_session" == "<new>" ]]; then
+  exec "$CODEX_BIN" "${codex_args[@]}" -C "$selected_dir" "${passthrough_args[@]}"
+fi
+
+exec "$CODEX_BIN" "${codex_args[@]}" resume "$selected_session" -C "$selected_dir" "${passthrough_args[@]}"
